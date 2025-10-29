@@ -87,26 +87,35 @@ class OutlookEventParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.events = []
+        self.processed_events = set()  # To avoid duplicates
         
     def handle_starttag(self, tag, attrs):
         """Extract event data from div tags with aria-label attributes."""
         if tag == "div":
             attrs_dict = dict(attrs)
             aria_label = attrs_dict.get("aria-label", "")
+            role = attrs_dict.get("role", "")
             
             # Look for calendar event patterns in aria-label
-            if " to " in aria_label and ("Monday" in aria_label or "Tuesday" in aria_label or 
+            # Support both old format and new Outlook Web format with role="button"
+            if ((" to " in aria_label and ("AM" in aria_label or "PM" in aria_label)) and 
+                ("Monday" in aria_label or "Tuesday" in aria_label or 
                 "Wednesday" in aria_label or "Thursday" in aria_label or 
-                "Friday" in aria_label or "Saturday" in aria_label or "Sunday" in aria_label):
+                "Friday" in aria_label or "Saturday" in aria_label or "Sunday" in aria_label)):
                 
                 event_data = self.parse_event_label(aria_label)
                 if event_data:
-                    self.events.append(event_data)
+                    # Create a unique key to avoid duplicates (same event repeated in HTML)
+                    event_key = f"{event_data['summary']}_{event_data['start'].isoformat()}"
+                    if event_key not in self.processed_events:
+                        self.processed_events.add(event_key)
+                        self.events.append(event_data)
     
     def parse_event_label(self, label):
         """Parse event information from aria-label text."""
         try:
-            # Pattern: "Event Name, HH:MM to HH:MM, Day, Month DD, YYYY, By Organizer, Status, Type"
+            # Pattern: "Event Name, H:MM AM to H:MM AM, Day, Month DD, YYYY, By Organizer, Status, Type"
+            # Example: "CSVCS- Daily Stand Up, 7:30 AM to 8:00 AM, Monday, September 29, 2025, By Veronica Sanchez, Tentative, Recurring event"
             
             # Split by commas but be careful with commas in event names
             parts = label.split(", ")
@@ -114,8 +123,8 @@ class OutlookEventParser(HTMLParser):
             if len(parts) < 5:
                 return None
             
-            # Find the time pattern (HH:MM to HH:MM)
-            time_pattern = re.compile(r'(\d{1,2}):(\d{2}) to (\d{1,2}):(\d{2})')
+            # Find the time pattern (H:MM AM/PM to H:MM AM/PM)
+            time_pattern = re.compile(r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*to\s*(\d{1,2}):(\d{2})\s*(AM|PM)', re.IGNORECASE)
             time_idx = None
             time_match = None
             
@@ -126,14 +135,27 @@ class OutlookEventParser(HTMLParser):
                     time_match = match
                     break
             
-            if not time_idx or not time_match:
+            if time_idx is None or not time_match:
                 return None
             
             # Event name is everything before the time
             event_name = ", ".join(parts[:time_idx])
             
-            # Extract times
-            start_hour, start_min, end_hour, end_min = time_match.groups()
+            # Extract times with AM/PM
+            start_hour, start_min, start_ampm, end_hour, end_min, end_ampm = time_match.groups()
+            
+            # Convert to 24-hour format
+            start_hour_24 = int(start_hour)
+            if start_ampm.upper() == 'PM' and start_hour_24 != 12:
+                start_hour_24 += 12
+            elif start_ampm.upper() == 'AM' and start_hour_24 == 12:
+                start_hour_24 = 0
+                
+            end_hour_24 = int(end_hour)
+            if end_ampm.upper() == 'PM' and end_hour_24 != 12:
+                end_hour_24 += 12
+            elif end_ampm.upper() == 'AM' and end_hour_24 == 12:
+                end_hour_24 = 0
             
             # Find date (Day, Month DD, YYYY)
             # The day comes right after the time
@@ -149,8 +171,8 @@ class OutlookEventParser(HTMLParser):
             date_obj = datetime.strptime(date_str, "%B %d, %Y")
             
             # Combine date with times
-            start_time = date_obj.replace(hour=int(start_hour), minute=int(start_min))
-            end_time = date_obj.replace(hour=int(end_hour), minute=int(end_min))
+            start_time = date_obj.replace(hour=start_hour_24, minute=int(start_min))
+            end_time = date_obj.replace(hour=end_hour_24, minute=int(end_min))
             
             # Extract organizer (comes after "By ")
             organizer = ""
