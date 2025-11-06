@@ -107,6 +107,7 @@ class OutlookEventParser(HTMLParser):
         """Parse event information from aria-label text."""
         try:
             # Pattern: "Event Name, HH:MM to HH:MM, Day, Month DD, YYYY, By Organizer, Status, Type"
+            # Weekly view may include: "Event Name, HH:MM to HH:MM, Day, Month DD, YYYY, Microsoft Teams Meeting, By Organizer, Status, Type"
             
             # Split by commas but be careful with commas in event names
             parts = label.split(", ")
@@ -152,12 +153,21 @@ class OutlookEventParser(HTMLParser):
             start_time = date_obj.replace(hour=int(start_hour), minute=int(start_min))
             end_time = date_obj.replace(hour=int(end_hour), minute=int(end_min))
             
-            # Extract organizer (comes after "By ")
+            # Extract location (e.g., "Microsoft Teams Meeting") - comes between date and organizer
+            location = ""
             organizer = ""
-            for part in parts[time_idx + 4:]:
+            for i, part in enumerate(parts[time_idx + 4:], start=time_idx + 4):
+                # Check for location indicators (before "By ")
                 if part.startswith("By "):
                     organizer = part[3:].strip()
                     break
+                # Common location patterns
+                elif "Microsoft Teams Meeting" in part or "Teams" in part:
+                    location = part.strip()
+                elif "Meeting" in part and not part.startswith("By "):
+                    # Could be a location
+                    if not location:
+                        location = part.strip()
             
             # Extract status and type
             status = ""
@@ -178,7 +188,8 @@ class OutlookEventParser(HTMLParser):
                 "organizer": organizer,
                 "status": status,
                 "event_type": event_type,
-                "is_canceled": is_canceled
+                "is_canceled": is_canceled,
+                "location": location  # Add location field
             }
             
         except Exception as e:
@@ -242,6 +253,10 @@ class ICSGenerator:
             # Create email from organizer name (simplified - just use first word as username)
             organizer_name = event["organizer"].split()[0].lower() if event["organizer"] else "organizer"
             self.ics_lines.append(f"ORGANIZER;CN={self.escape_text(event['organizer'])}:mailto:{organizer_name}@{self.email_domain}")
+        
+        # Add location if available
+        if event.get("location"):
+            self.ics_lines.append(f"LOCATION:{self.escape_text(event['location'])}")
         
         if event["event_type"]:
             self.ics_lines.append(f"DESCRIPTION:{self.escape_text(event['event_type'])}")
@@ -559,14 +574,18 @@ class GoogleCalendarExporter:
             else:
                 google_event['description'] = ""
             
-            # Add Teams meeting link to description and location (if configured)
+            # Add location from parsed event or Teams meeting link
+            if event_data.get('location'):
+                google_event['location'] = event_data['location']
+            elif teams_link:
+                google_event['location'] = "Microsoft Teams Meeting"
+            
+            # Add Teams meeting link to description (if configured)
             if teams_link:
                 if google_event['description']:
                     google_event['description'] += f"\n\nMicrosoft Teams Meeting:\n{teams_link}"
                 else:
                     google_event['description'] = f"Microsoft Teams Meeting:\n{teams_link}"
-                
-                google_event['location'] = "Microsoft Teams Meeting"
             
             # Add status
             status_map = {
@@ -672,6 +691,66 @@ class GoogleCalendarExporter:
         return True
 
 
+def merge_events(monthly_events, weekly_events):
+    """Merge events from weekly calendar to enhance monthly calendar events.
+    
+    Args:
+        monthly_events: List of events from monthly calendar
+        weekly_events: List of events from weekly calendar
+        
+    Returns:
+        Enhanced list of events with details from weekly calendar merged in
+    """
+    # Create a lookup dictionary for weekly events by (summary, start_time, end_time)
+    weekly_lookup = {}
+    for event in weekly_events:
+        key = (
+            event['summary'],
+            event['start'].strftime('%Y-%m-%d %H:%M'),
+            event['end'].strftime('%H:%M')
+        )
+        weekly_lookup[key] = event
+    
+    # Enhance monthly events with weekly calendar details
+    enhanced_events = []
+    for event in monthly_events:
+        key = (
+            event['summary'],
+            event['start'].strftime('%Y-%m-%d %H:%M'),
+            event['end'].strftime('%H:%M')
+        )
+        
+        # Check if we have a matching event in weekly calendar
+        if key in weekly_lookup:
+            weekly_event = weekly_lookup[key]
+            # Enhance with location if available in weekly view
+            if weekly_event.get('location') and not event.get('location'):
+                event['location'] = weekly_event['location']
+            # Enhance with other details if needed
+            # (weekly calendar might have more accurate organizer, status, etc.)
+            if weekly_event.get('organizer') and not event.get('organizer'):
+                event['organizer'] = weekly_event['organizer']
+        
+        enhanced_events.append(event)
+    
+    # Add any events from weekly calendar that weren't in monthly calendar
+    monthly_keys = {
+        (e['summary'], e['start'].strftime('%Y-%m-%d %H:%M'), e['end'].strftime('%H:%M'))
+        for e in monthly_events
+    }
+    
+    for event in weekly_events:
+        key = (
+            event['summary'],
+            event['start'].strftime('%Y-%m-%d %H:%M'),
+            event['end'].strftime('%H:%M')
+        )
+        if key not in monthly_keys:
+            enhanced_events.append(event)
+    
+    return enhanced_events
+
+
 def main():
     """Main function to convert Outlook HTML to ICS or Google Calendar."""
     # Parse command-line arguments
@@ -763,6 +842,12 @@ Examples:
         help='Enable verbose output for debugging (shows duplicate detection details)'
     )
     
+    parser.add_argument(
+        '--weekly-calendar',
+        default=os.getenv('OUTLOOK_WEEKLY_FILE'),
+        help='Optional weekly calendar HTML/MHTML file to enhance events with additional details (default: from .env OUTLOOK_WEEKLY_FILE)'
+    )
+    
     args = parser.parse_args()
     
     input_file = Path(args.input_file)
@@ -796,13 +881,43 @@ Examples:
         print("Error: Could not extract HTML content from file", file=sys.stderr)
         sys.exit(1)
     
-    # Parse events
-    print("Parsing events...")
+    # Parse events from monthly calendar
+    print("Parsing events from monthly calendar...")
     parser = OutlookEventParser()
     parser.feed(html_content)
     
-    events = parser.events
-    print(f"Found {len(events)} events")
+    monthly_events = parser.events
+    print(f"Found {len(monthly_events)} events in monthly calendar")
+    
+    # Parse weekly calendar if provided
+    weekly_events = []
+    if args.weekly_calendar:
+        weekly_file = Path(args.weekly_calendar)
+        if weekly_file.exists():
+            print(f"\nParsing events from weekly calendar: {weekly_file}")
+            try:
+                weekly_html = extract_html_from_mhtml(weekly_file)
+                if not weekly_html:
+                    with open(weekly_file, 'r', encoding='utf-8') as f:
+                        weekly_html = f.read()
+                
+                weekly_parser = OutlookEventParser()
+                weekly_parser.feed(weekly_html)
+                weekly_events = weekly_parser.events
+                print(f"Found {len(weekly_events)} events in weekly calendar")
+                
+                # Merge weekly events to enhance monthly events
+                events = merge_events(monthly_events, weekly_events)
+                print(f"Enhanced to {len(events)} total events (merged weekly calendar details)")
+            except Exception as e:
+                print(f"Warning: Could not parse weekly calendar: {e}", file=sys.stderr)
+                print("Continuing with monthly calendar only...", file=sys.stderr)
+                events = monthly_events
+        else:
+            print(f"Warning: Weekly calendar file '{weekly_file}' not found, using monthly calendar only", file=sys.stderr)
+            events = monthly_events
+    else:
+        events = monthly_events
     
     if not events:
         print("Warning: No events found in the HTML file.", file=sys.stderr)
@@ -813,6 +928,8 @@ Examples:
     for i, event in enumerate(events[:5]):
         print(f"{i+1}. {event['summary']}")
         print(f"   {event['start'].strftime('%Y-%m-%d %H:%M')} - {event['end'].strftime('%H:%M')}")
+        if event.get('location'):
+            print(f"   Location: {event['location']}")
         print(f"   Organizer: {event['organizer']}")
         print(f"   Status: {event['status']}")
         if event['event_type']:
